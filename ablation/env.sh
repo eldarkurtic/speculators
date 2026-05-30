@@ -4,7 +4,11 @@
 # If the repo or model paths differ on a new server, edit REPO / VERIFIER below (only these two).
 
 export REPO="${REPO:-/home/eldarkurtic/github/speculators}"
-export PY="$REPO/venv_spec/bin/python"                       # training venv (editable speculators)
+export PY="$REPO/venv_spec/bin/python"                       # training venv (editable speculators; NO vllm)
+# vLLM lives in a separate env. launch_vllm.py execs `sys.executable -m vllm...`, so the HS SERVER
+# must run under a vllm-capable python. The data-gen CLIENT (data_generation_offline.py) needs
+# speculators+openai (not vllm) → runs under $PY. Override VLLM_PY if it moves.
+export VLLM_PY="${VLLM_PY:-/home/eldarkurtic/github/eldarkurtic/llm-compressor/venv_lmeval/bin/python}"
 export VERIFIER="${VERIFIER:-/home/eldarkurtic/hf_models/Qwen/Qwen3-8B}"
 
 # Dataset: NON-FP8 magpie 5k (user switched from the FP8 variant).

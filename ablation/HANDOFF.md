@@ -48,9 +48,12 @@ then sweep training/loss/architecture knobs as fast parallel 1-GPU runs. Screen 
 ---
 
 ## Environment facts (verified on old box — re-verify on new box)
-- **venv (training):** `venv_spec/bin/python` (uv venv, editable `speculators`). It is the `python`
-  on PATH. **Plotting only** uses `data_for_plots/.venv` (has matplotlib/pandas). Don't `pip install`
-  into the ambient env.
+- **venv (training):** `venv_spec/bin/python` (uv venv, editable `speculators`; the `python` on
+  PATH). **Has NO vllm** and no ruff/mypy. **Plotting only** uses `data_for_plots/.venv`.
+- **venv (vLLM serving):** `VLLM_PY` in `env.sh` = the llm-compressor `venv_lmeval` python (vllm
+  0.20.2). `launch_vllm.py` execs `sys.executable -m vllm`, so the HS server MUST run under this; the
+  data-gen *client* runs under `venv_spec` (needs speculators+openai, not vllm). `gen_cache.sh`
+  already splits them. If `venv_lmeval` moves, set `VLLM_PY`.
 - **Dataset:** `output_dir/Qwen3-8B_magpie_5k/` (non-FP8 — user switched from the FP8 variant;
   same structure) — 5000 examples; columns `input_ids`(int32), `loss_mask`(bool, **assistant-only**),
   `seq_len`; lengths 226–8192 (mean ~4025). 90/10 train/val **by index** (train 0–4499, val
@@ -88,28 +91,29 @@ then sweep training/loss/architecture knobs as fast parallel 1-GPU runs. Screen 
 - **Loader/cache:** `train/data.py:223-330` — `_map_to_file_idx`, `_get_raw_data` (aux `[:,:-1]`/last `[:,-1]`).
 - **Noise:** `train/noise_transforms.py` — `AddUniformNoise`/`AddGaussianNoise(std)`.
 
-## Code changes to implement (test on new box; none applied yet)
-Apply incrementally, run `make quality` on touched files, keep eagle3 path intact.
-1. **Loader aux-subset** (`train/data.py`, needed for Phase 1.5+E): given the cached superset
-   `[1,5,9,13,17,21,25,29,34,36]`, select the channels matching the run's `--target-layer-ids` (and
-   keep `[:, -1]` as target). Map layer-id→stored-index; pass the superset id-list via CLI or a
-   small `cache_meta.json` written in Phase 1. **Required even to reproduce the baseline from cache.**
-2. **Expose optimizer/optim knobs** (`scripts/train.py` + `train/trainer.py:146`): `--optimizer`
-   (adamw|sgd|lion|adafactor|rmsprop|...), `--weight-decay`, `--adam-betas`, `--grad-clip`
-   (replace hardcoded 1.0 at trainer.py:208). See §Ablation A/optimizers (user explicitly asked to
-   ablate optimizers beyond Adam).
-3. **Expose `--loss-gamma`** and thread to `compute_metrics` (core.py → metrics.py:42-49).
-4. **Loss variants** (`models/metrics.py`): add `reverse_kl_loss`, `kl_ce_blend`, label-smoothed CE,
-   and an **LK acceptance loss** (draft/verifier prob-ratio acceptance objective). Select via
-   `--loss-type` CLI.
-5. **Val-noise toggle** (`scripts/train.py:316`): `--no-val-noise` (don't augment val) — likely a
-   clean quick win; currently val loss is measured on noised inputs.
-6. **Train-on-user-tokens** (`scripts/train.py`/`data.py`): `--loss-on-all-tokens` (or include-user)
-   → override `loss_mask`.
-7. **EAL metric:** add expected-accepted-length `EAL = Σ_k Π_{i≤k} acc_i` from per-position acc to
-   logging; compute from RESULTS via `ablation/eal.py`. Headline spec-decoding metric.
-8. *(stretch)* **Attention-drift alignment** (F): needs verifier attention maps (not extracted) →
-   KL(draft attn ‖ target attn). Heavy: changes data-gen + model. Only if Phase-2 signal warrants.
+## Code changes — IMPLEMENTED & unit-verified (branch `dflash-ablation`)
+All of these are done, py_compile-clean, and unit-tested (losses/dispatch/EAL/layer-subset on random
+tensors; argparse `--help` clean). End-to-end validation = the baseline-from-cache control (§Phase 1.5).
+`make quality` not run — ruff/mypy are NOT installed in `venv_spec` (dev extras missing); install via
+`uv pip install ruff mypy` into `venv_spec` if you want the style/type gate.
+1. **Loader aux-subset** (`train/data.py`): `ArrowDataset(cache_layer_ids=, aux_layer_ids=)` +
+   `_resolve_layer_selection`; `--cache-layer-ids` in `train.py` (run.sh passes the superset).
+   `[1,9,17,25,34]` from the 10-layer cache → channels `[0,2,4,6,8]`, target = last.
+2. **Optimizer knobs** (`trainer.py` `_build_optimizer` + `TrainerConfig`; `train.py`): `--optimizer`
+   {adamw,adam,sgd,rmsprop,adafactor,lion}, `--weight-decay`, `--adam-betas`, `--sgd-momentum`,
+   `--grad-clip` (replaces the hardcoded 1.0). NOTE: `lion` needs `pip install lion-pytorch`.
+3. **Loss variants** (`models/metrics.py` + `dflash/metrics.py` `_select_loss_fn`; `core.py` reads
+   `self.loss_type/loss_gamma/label_smoothing` set in `from_training_args`): `--loss-type`
+   {ce,kl,reverse_kl,kl_ce,lk}, `--loss-gamma`, `--label-smoothing`. `lk` = `1 - Σ min(p_d,p_t)`
+   (acceptance-rate surrogate). Default `ce`+gamma 4.0 reproduces the old hardcoded behaviour.
+4. **EAL metric:** `dflash/metrics.py compute_metrics` now logs `eal = Σ_k Π_{i≤k} acc_i`.
+5. **`--noise-type` {uniform,gaussian}** (`train.py`). CORRECTION: the val loader already gets NO
+   noise (it never passed `transform=`), so the "remove val noise" idea was moot and was dropped.
+6. **`--loss-on-all-tokens`** (`train.py`/`data.py`): overrides the assistant-only mask on the TRAIN
+   split only; val keeps assistant-only as the metric of record.
+7. *(NOT done — stretch)* **Attention-drift alignment** (matrix F): needs verifier attention maps
+   (not extracted) → KL(draft attn ‖ target attn). Heavy: changes data-gen + model. Only if Phase-2
+   signal warrants.
 
 ## Ablation matrix (screen @2ep; ~50+ runs)
 Rank by **val loss** + **EAL** + per-position acc. One knob at a time vs the cache-baseline control.
@@ -132,8 +136,9 @@ Rank by **val loss** + **EAL** + per-position acc. One knob at a time vs the cac
 - LK acceptance loss
 
 **D. Data / augmentation**
-- noise-std ∈ {0, 0.01, 0.05(base), 0.1}; Gaussian vs Uniform; **no-val-noise**
-- train-on-user-tokens (vs assistant-only base)
+- `--noise-std` ∈ {0, 0.01, 0.05(base), 0.1}; `--noise-type` gaussian vs uniform (val is already
+  un-noised — no toggle needed)
+- `--loss-on-all-tokens` (vs assistant-only base)
 
 **E. Layer selection** — **OFFLOADED to a dedicated node**; see `HANDOFF_LAYER_SELECTION.md`. Do not
 run on this node.

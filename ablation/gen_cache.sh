@@ -12,8 +12,8 @@ source "$(dirname "$0")/env.sh"
 MAX_SAMPLES="${1:-}"          # empty => all
 SERVER_LOG="$ABL/logs/hs_server.log"
 
-echo ">> Launching vLLM hidden-state server (layers: $SUPERSET_LAYERS) ..."
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$PY" "$REPO/scripts/launch_vllm.py" "$VERIFIER" \
+echo ">> Launching vLLM hidden-state server (layers: $SUPERSET_LAYERS) via VLLM_PY ..."
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$VLLM_PY" "$REPO/scripts/launch_vllm.py" "$VERIFIER" \
   --hidden-states-path "$HS_SCRATCH" \
   --target-layer-ids $SUPERSET_LAYERS \
   -- --max-model-len 12288 -tp 1 --data-parallel-size 8 --gpu-memory-utilization 0.9 \

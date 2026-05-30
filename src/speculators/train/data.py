@@ -181,6 +181,9 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        cache_layer_ids: list[int] | None = None,
+        aux_layer_ids: list[int] | None = None,
+        loss_on_all_tokens: bool = False,
     ):
         """Initialize the ArrowDataset.
         Args:
@@ -189,6 +192,12 @@ class ArrowDataset(BaseDataset):
             arrow dataset.
             transform: The transform to apply to the data.
             hidden_states_dtype: The dtype of the hidden states.
+            cache_layer_ids: Ordered verifier layer ids stored per sample in the cache
+                (e.g. a 10-layer superset). The last id is the verifier target layer.
+            aux_layer_ids: Subset of ``cache_layer_ids`` to feed the draft model as
+                fused auxiliary hidden states. If both are given, only these channels
+                are selected (so a superset cache can serve many layer choices). If
+                unset, all-but-last cached layers are used (legacy behaviour).
         """
         self.data = load_from_disk(datapath)
         if split_ratio == 1.0:
@@ -216,9 +225,34 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self._aux_indices, self._target_index = self._resolve_layer_selection(
+            cache_layer_ids, aux_layer_ids
+        )
+        self.loss_on_all_tokens = loss_on_all_tokens
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
+
+    @staticmethod
+    def _resolve_layer_selection(
+        cache_layer_ids: list[int] | None, aux_layer_ids: list[int] | None
+    ) -> tuple[list[int] | None, int]:
+        """Map requested aux layers to channel indices within the cached layers.
+
+        Returns ``(aux_indices, target_index)``. ``aux_indices is None`` means use all
+        cached layers except the last (legacy). The target (verifier last hidden state)
+        is always the final cached layer.
+        """
+        if cache_layer_ids and aux_layer_ids:
+            missing = [lid for lid in aux_layer_ids if lid not in cache_layer_ids]
+            if missing:
+                raise ValueError(
+                    f"Requested aux layer ids {missing} are not in the cached layer "
+                    f"ids {cache_layer_ids}. Regenerate the cache or pick a subset."
+                )
+            aux_indices = [cache_layer_ids.index(lid) for lid in aux_layer_ids]
+            return aux_indices, len(cache_layer_ids) - 1
+        return None, -1
 
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
@@ -318,15 +352,23 @@ class ArrowDataset(BaseDataset):
             )
             return None
 
+        hs = loaded_hs["hidden_states"]  # [seq_len, num_cached_layers, hidden_size]
+        if self._aux_indices is None:
+            aux_hs = hs[:, :-1].flatten(1)  # legacy: all-but-last
+        else:
+            aux_hs = hs[:, self._aux_indices].flatten(1)  # selected subset
+
+        loss_mask = self.data[index]["loss_mask"]  # [seq_len]
+        if self.loss_on_all_tokens:
+            loss_mask = torch.ones_like(loss_mask)  # include user/system tokens too
+
         return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
-                1
-            ),  # [seq_len, 3 * hidden_size]
+            "hidden_states": aux_hs,  # [seq_len, len(aux) * hidden_size]
             "input_ids": loaded_hs["token_ids"],  # [seq_len]
-            "verifier_last_hidden_states": loaded_hs["hidden_states"][
-                :, -1
+            "verifier_last_hidden_states": hs[
+                :, self._target_index
             ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "loss_mask": loss_mask,
         }
 
 

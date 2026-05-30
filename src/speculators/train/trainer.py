@@ -48,6 +48,11 @@ class TrainerConfig(NamedTuple):
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
+    optimizer: str = "adamw"
+    weight_decay: float = 0.0
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    sgd_momentum: float = 0.9
+    grad_clip: float = 1.0
 
 
 class Trainer:
@@ -141,9 +146,58 @@ class Trainer:
             del full_state_dict
             dist.barrier()
 
+    def _build_optimizer(self):
+        cfg = self.config
+        name = cfg.optimizer.lower()
+        # torch built-ins accept named_parameters() (torch 2.x); external optimizers
+        # get plain params.
+        named = self.model.named_parameters()
+        plain = [p for _, p in self.model.named_parameters()]
+        if name == "adamw":
+            return torch.optim.AdamW(
+                named, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.adam_betas
+            )
+        if name == "adam":
+            return torch.optim.Adam(
+                named, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.adam_betas
+            )
+        if name == "sgd":
+            return torch.optim.SGD(
+                named, lr=cfg.lr, momentum=cfg.sgd_momentum, weight_decay=cfg.weight_decay
+            )
+        if name == "rmsprop":
+            return torch.optim.RMSprop(
+                named, lr=cfg.lr, weight_decay=cfg.weight_decay, momentum=cfg.sgd_momentum
+            )
+        if name == "adafactor":
+            from transformers.optimization import Adafactor
+
+            return Adafactor(
+                plain,
+                lr=cfg.lr,
+                relative_step=False,
+                scale_parameter=False,
+                warmup_init=False,
+                weight_decay=cfg.weight_decay,
+            )
+        if name == "lion":
+            try:
+                from lion_pytorch import Lion
+            except ImportError as e:
+                raise ImportError(
+                    "--optimizer lion requires `pip install lion-pytorch` in venv_spec."
+                ) from e
+            return Lion(
+                plain, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.adam_betas
+            )
+        raise ValueError(
+            f"Unknown --optimizer '{cfg.optimizer}'. Choose from "
+            "adamw, adam, sgd, rmsprop, adafactor, lion."
+        )
+
     def setup_optimizer(self):
         # Setup optimizer
-        self.opt = torch.optim.AdamW(self.model.named_parameters(), lr=self.config.lr)
+        self.opt = self._build_optimizer()
         last_epoch = -1
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
             self.checkpointer.load_optimizer_state_dict(self.model, self.opt)
@@ -205,7 +259,10 @@ class Trainer:
 
             self.opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            if self.config.grad_clip and self.config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.grad_clip
+                )
             self.opt.step()
 
             current_lr = self.opt.param_groups[0]["lr"]

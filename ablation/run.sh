@@ -22,6 +22,7 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$REPO/scripts/train.py" \
   --draft-vocab-size "$DRAFT_VOCAB" \
   --max-anchors "$MAX_ANCHORS" \
   --scheduler-type cosine \
+  --cache-layer-ids $SUPERSET_LAYERS \
   --target-layer-ids $BASELINE_AUX \
   --num-layers 5 \
   --lr 0.0006 \

@@ -102,12 +102,14 @@ def kl_div_loss(
 def ce_loss(
     logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    label_smoothing: float = 0.0,
 ):
     """Compute per-position cross-entropy loss using argmax of target logits as labels.
 
     Args:
         logits: Draft model logits.
         targets: Target model logits (argmax taken to produce hard labels).
+        label_smoothing: Optional label smoothing in [0, 1).
 
     Returns:
         Per-position cross-entropy loss with shape [1, seq_len].
@@ -120,9 +122,41 @@ def ce_loss(
         target_ids.reshape(-1),
         reduction="none",
         ignore_index=-100,
+        label_smoothing=label_smoothing,
     ).reshape(batch_size, seq_len)
 
     return elementwise_loss  # noqa: RET504
+
+
+def reverse_kl_div_loss(
+    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+):
+    """Per-position reverse KL, KL(draft || target) = sum p_d (log p_d - log p_t).
+
+    Forward KL (``kl_div_loss``) is mass-covering; reverse KL is mode-seeking, which can
+    sharpen the draft toward the verifier's dominant token.
+    """
+    logp_d = torch.nn.functional.log_softmax(logits, dim=-1)
+    logp_t = torch.nn.functional.log_softmax(targets, dim=-1)
+    p_d = logp_d.exp()
+    return (p_d * (logp_d - logp_t)).sum(dim=-1)  # shape: [1, seq_len]
+
+
+def acceptance_loss(
+    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+):
+    """Per-position acceptance loss (LK-style): 1 - sum_v min(p_draft, p_target).
+
+    sum_v min(p_d, p_t) = 1 - TV(p_d, p_t) is exactly the expected token-acceptance
+    probability under speculative rejection sampling, so minimizing this directly
+    maximizes acceptance rate rather than a distillation proxy.
+    """
+    p_d = torch.nn.functional.softmax(logits, dim=-1)
+    p_t = torch.nn.functional.softmax(targets, dim=-1)
+    accept = torch.minimum(p_d, p_t).sum(dim=-1)  # shape: [1, seq_len]
+    return 1.0 - accept
 
 
 def dflash_loss_decay(pos_idx: torch.Tensor, gamma: float):

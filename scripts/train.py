@@ -28,7 +28,7 @@ from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
 )
 from speculators.train.logger import setup_metric_logger, setup_root_logger
-from speculators.train.noise_transforms import AddUniformNoise
+from speculators.train.noise_transforms import AddGaussianNoise, AddUniformNoise
 from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import (
     maybe_destroy_distributed,
@@ -286,7 +286,8 @@ def main(args: argparse.Namespace):
     # Setup dataloaders
     preprocess = shift_batch if args.speculator_type == "eagle3" else None
 
-    noise_transform = AddUniformNoise(std=args.noise_std)
+    noise_cls = AddGaussianNoise if args.noise_type == "gaussian" else AddUniformNoise
+    noise_transform = noise_cls(std=args.noise_std)
     if args.legacy_data:
         warnings.warn(
             "Using '--legacy-data' is deprecated and will be removed soon.",
@@ -319,6 +320,9 @@ def main(args: argparse.Namespace):
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
+            cache_layer_ids=args.cache_layer_ids,
+            aux_layer_ids=args.target_layer_ids,
+            loss_on_all_tokens=args.loss_on_all_tokens,
         )
         val_dataset = ArrowDataset(
             datapath=args.data_path,
@@ -332,6 +336,8 @@ def main(args: argparse.Namespace):
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=args.request_timeout,
             max_retries=args.max_retries,
+            cache_layer_ids=args.cache_layer_ids,
+            aux_layer_ids=args.target_layer_ids,
         )
 
     train_loader = setup_dataloader(
@@ -373,6 +379,11 @@ def main(args: argparse.Namespace):
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
+        optimizer=args.optimizer,
+        weight_decay=args.weight_decay,
+        adam_betas=tuple(args.adam_betas),
+        sgd_momentum=args.sgd_momentum,
+        grad_clip=args.grad_clip,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -492,6 +503,57 @@ def parse_args():
     parser.add_argument("--save-path", type=str, default="./output/checkpoints")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "adam", "sgd", "rmsprop", "adafactor", "lion"],
+        help="Optimizer to use (default: adamw).",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=0.0, help="Optimizer weight decay."
+    )
+    parser.add_argument(
+        "--adam-betas",
+        type=float,
+        nargs=2,
+        default=[0.9, 0.999],
+        help="Betas for adam/adamw/lion (default: 0.9 0.999).",
+    )
+    parser.add_argument(
+        "--sgd-momentum",
+        type=float,
+        default=0.9,
+        help="Momentum for sgd/rmsprop (default: 0.9).",
+    )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Max grad norm; <=0 disables clipping (default: 1.0).",
+    )
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="ce",
+        choices=["ce", "kl", "reverse_kl", "kl_ce", "lk"],
+        help=(
+            "DFlash distillation loss: ce (hard-label, default), kl (forward KL), "
+            "reverse_kl, kl_ce (blend), lk (acceptance-rate surrogate)."
+        ),
+    )
+    parser.add_argument(
+        "--loss-gamma",
+        type=float,
+        default=4.0,
+        help="Position-decay gamma for the DFlash loss (higher = slower decay).",
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for --loss-type ce.",
+    )
     parser.add_argument("--no-resume-from-checkpoint", action="store_true")
     parser.add_argument(
         "--logger",
@@ -533,6 +595,19 @@ def parse_args():
             "(Optional) A (space separated) list of integer layer ids. Defaults to"
             "[2, num_hidden_layers // 2, num_hidden_layers - 3, num_hidden_layers]. "
             "Note: must be set explicitly if custom values were used to launch vllm"
+        ),
+    )
+    parser.add_argument(
+        "--cache-layer-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "(Optional) Ordered verifier layer ids stored per sample in the hidden-"
+            "state cache (e.g. a superset like 1 5 9 13 17 21 25 29 34 36). When set "
+            "together with --target-layer-ids, only the requested aux layers are "
+            "selected from the cache, so one superset cache can serve many layer "
+            "choices without regeneration. The last id is the verifier target layer."
         ),
     )
     parser.add_argument(
@@ -627,6 +702,21 @@ def parse_args():
         type=float,
         default=0.05,
         help="Standard deviation for noise augmentation",
+    )
+    parser.add_argument(
+        "--noise-type",
+        type=str,
+        default="uniform",
+        choices=["uniform", "gaussian"],
+        help="Noise distribution added to train hidden states (default: uniform).",
+    )
+    parser.add_argument(
+        "--loss-on-all-tokens",
+        action="store_true",
+        help=(
+            "Train on ALL tokens (override the assistant-only loss mask) on the train "
+            "split. Validation keeps the assistant-only mask as the metric of record."
+        ),
     )
     # Checkpoint Parameters
     parser.add_argument(

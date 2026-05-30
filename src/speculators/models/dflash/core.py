@@ -169,6 +169,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()
+        # Training-only loss configuration (not persisted in config.json).
+        model.loss_type = kwargs.get("loss_type", "ce")
+        model.loss_gamma = kwargs.get("loss_gamma", 4.0)
+        model.label_smoothing = kwargs.get("label_smoothing", 0.0)
         return model
 
     @staticmethod
@@ -303,7 +307,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         aligned_loss_mask[:, :: self.block_size] = 0
         loss, metrics = compute_metrics(
-            logits, targets, aligned_loss_mask, self.block_size
+            logits,
+            targets,
+            aligned_loss_mask,
+            self.block_size,
+            gamma=getattr(self, "loss_gamma", 4.0),
+            loss_type=getattr(self, "loss_type", "ce"),
+            label_smoothing=getattr(self, "label_smoothing", 0.0),
         )
         draft_tokens = torch.argmax(logits, dim=-1)
 
