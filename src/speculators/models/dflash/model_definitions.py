@@ -160,12 +160,15 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
+        # Ablation knob: drop the FFN/MLP sub-block (attention-only draft layer).
+        self.use_mlp = getattr(config, "decoder_use_mlp", True)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # type: ignore[arg-type]
-        self.post_attention_layernorm = Qwen3RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,  # type: ignore[arg-type]
-        )
+        if self.use_mlp:
+            self.mlp = Qwen3MLP(config)
+            self.post_attention_layernorm = Qwen3RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,  # type: ignore[arg-type]
+            )
 
     def forward(
         self,
@@ -201,6 +204,8 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states  # type: ignore[operator]
+        if not self.use_mlp:
+            return hidden_states  # type: ignore[return-value]
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)

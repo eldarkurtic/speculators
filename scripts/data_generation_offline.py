@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -246,6 +247,27 @@ def check_safetensors_file(path: Path, tokens: list[int]):
             )
 
 
+def _check_safetensors_with_retry(
+    path: Path, tokens: list[int], attempts: int = 12, delay: float = 1.0
+):
+    """``check_safetensors_file`` with retries.
+
+    The vLLM server writes the hidden-state file asynchronously and can return its
+    path before the write is fully flushed; an immediate read then fails with
+    "incomplete metadata, file not fully covered" and would wrongly drop a sample
+    whose file completes moments later. Retry the read before giving up. Runs in a
+    worker thread (via asyncio.to_thread), so the time.sleep does not block the loop.
+    """
+    for attempt in range(attempts):
+        try:
+            check_safetensors_file(path, tokens)
+            return
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 async def worker(
     client,
     model: str,
@@ -295,7 +317,9 @@ async def worker(
                 )
                 if validate_outputs:
                     await asyncio.to_thread(
-                        check_safetensors_file, target_hidden_states_path, input_ids
+                        _check_safetensors_with_retry,
+                        target_hidden_states_path,
+                        input_ids,
                     )
         except Exception as e:
             if fail_on_error:

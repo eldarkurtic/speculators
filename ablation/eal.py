@@ -9,8 +9,8 @@ i.e. a token at position k is accepted only if all earlier positions were also c
 more tokens accepted per verifier step = bigger speedup.
 
 Usage:
-  venv_spec/bin/python ablation/eal.py --accs 0.92 0.78 0.61 0.45      # compute from numbers
-  venv_spec/bin/python ablation/eal.py --scan ablation/logs           # best-effort scan of run logs
+  .venv/bin/python ablation/eal.py --accs 0.92 0.78 0.61 0.45      # compute from numbers
+  .venv/bin/python ablation/eal.py --scan ablation/logs           # best-effort scan of run logs
 (wandb is the source of truth; the log scan is a convenience.)
 """
 

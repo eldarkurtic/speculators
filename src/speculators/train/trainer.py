@@ -49,10 +49,55 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     optimizer: str = "adamw"
-    weight_decay: float = 0.0
+    weight_decay: float = 0.01  # torch AdamW's implicit default (pre-refactor baseline)
     adam_betas: tuple[float, float] = (0.9, 0.999)
     sgd_momentum: float = 0.9
     grad_clip: float = 1.0
+    muon_lr: float = 0.02  # Muon matrix-group LR (NOT comparable to AdamW lr; re-sweep)
+    muon_momentum: float = 0.95
+
+
+class _MuonAuxAdam(torch.optim.Optimizer):
+    """Single-optimizer facade over torch.optim.Muon (2D weight matrices) + AdamW
+    (embeddings / LM head / norms / biases).
+
+    torch.optim.Muon is Muon-only and hard-errors on any non-2D parameter, so the two
+    optimizers are run together behind one Optimizer interface. This keeps the trainer's
+    single ``self.opt`` / single LR scheduler / single checkpointer paths working
+    unchanged. param_groups are exposed Muon-first so the logged LR (param_groups[0])
+    reflects the Muon group, and the HF LR scheduler mutates both groups' 'lr' in place.
+    """
+
+    def __init__(
+        self, muon: torch.optim.Optimizer, adamw: torch.optim.Optimizer
+    ) -> None:
+        self._muon = muon
+        self._adamw = adamw
+        all_params = [
+            p for g in (*muon.param_groups, *adamw.param_groups) for p in g["params"]
+        ]
+        # super().__init__ gives us the Optimizer bookkeeping the LR scheduler needs
+        # (_step_count, hook dicts, ...); we then point param_groups at the real
+        # sub-optimizer groups so scheduler LR updates propagate to Muon and AdamW.
+        super().__init__(all_params, {"lr": muon.param_groups[0]["lr"]})
+        self.param_groups = muon.param_groups + adamw.param_groups
+
+    def step(self, closure=None):  # type: ignore[override]
+        loss = closure() if closure is not None else None
+        self._muon.step()
+        self._adamw.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
+        self._muon.zero_grad(set_to_none=set_to_none)
+        self._adamw.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {"muon": self._muon.state_dict(), "adamw": self._adamw.state_dict()}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._muon.load_state_dict(state_dict["muon"])
+        self._adamw.load_state_dict(state_dict["adamw"])
 
 
 class Trainer:
@@ -146,7 +191,7 @@ class Trainer:
             del full_state_dict
             dist.barrier()
 
-    def _build_optimizer(self):
+    def _build_optimizer(self):  # noqa: PLR0911  (one return per supported optimizer)
         cfg = self.config
         name = cfg.optimizer.lower()
         # torch built-ins accept named_parameters() (torch 2.x); external optimizers
@@ -190,10 +235,49 @@ class Trainer:
             return Lion(
                 plain, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.adam_betas
             )
+        if name == "muon":
+            return self._build_muon_optimizer()
         raise ValueError(
             f"Unknown --optimizer '{cfg.optimizer}'. Choose from "
-            "adamw, adam, sgd, rmsprop, adafactor, lion."
+            "adamw, adam, sgd, rmsprop, adafactor, lion, muon."
         )
+
+    def _build_muon_optimizer(self):
+        """Hybrid Muon (2D weight matrices) + AdamW (embeddings/head/norms/biases).
+
+        torch.optim.Muon is Muon-only and errors on non-2D params, so parameters are
+        split by role. Single-GPU only: under FSDP2 sharding, Newton-Schulz on a
+        per-rank shard is mathematically wrong.
+        """
+        cfg = self.config
+        if self.is_distributed:
+            raise NotImplementedError(
+                "--optimizer muon is single-GPU only: under multi-GPU this trainer "
+                "shards params with FSDP2, and torch.optim.Muon's Newton-Schulz step "
+                "on a per-rank shard is mathematically wrong. Run Muon on one GPU."
+            )
+        # name-excluded matrices (embed/lm_head/verifier) are frozen anyway
+        exclude = ("embed_tokens", "lm_head", "verifier_lm_head")
+        matrix_params, aux_params = [], []
+        for pname, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2 and not any(k in pname for k in exclude):
+                matrix_params.append(p)
+            else:
+                aux_params.append(p)
+        muon = torch.optim.Muon(
+            matrix_params,
+            lr=cfg.muon_lr,
+            momentum=cfg.muon_momentum,
+            weight_decay=cfg.weight_decay,
+        )
+        if not aux_params:
+            return muon
+        adamw = torch.optim.AdamW(
+            aux_params, lr=cfg.lr, betas=cfg.adam_betas, weight_decay=cfg.weight_decay
+        )
+        return _MuonAuxAdam(muon, adamw)
 
     def setup_optimizer(self):
         # Setup optimizer

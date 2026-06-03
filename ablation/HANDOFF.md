@@ -1,3 +1,8 @@
+> ⚠️ **SUPERSEDED — start at [`HANDOFF_CONTINUE.md`](HANDOFF_CONTINUE.md).** That file reflects the
+> actual work done (architecture + masking + loss-function ablations, final recipe, current state).
+> This file below is the *original pre-session plan* (optimizer/loss/layer "families"); the
+> layer-selection sweep was dropped and the plan pivoted. Kept for history only.
+
 # DFlash Ablation Study — Session Handoff / Resume Checkpoint
 
 > **Purpose:** This file lets a fresh Claude Code session (on the new 8×H100 server) resume the
@@ -20,13 +25,15 @@ then sweep training/loss/architecture knobs as fast parallel 1-GPU runs. Screen 
 **@2 epochs**, promote winners **@5 epochs**, then stack compatible winners.
 
 ## RESUME HERE — checklist for the new server
-1. **Verify env:**
-   - `cd /home/eldarkurtic/github/speculators`
-   - `venv_spec/bin/python -c "import speculators, torch; print(torch.cuda.device_count())"` → expect 8.
+1. **Verify env:** *(done on the 8×H100 box `rhel-h100-02`, 2026-05-30 — paths in `ablation/env.sh`
+   now point here.)*
+   - `cd /home/eldarkurtic/github/eldarkurtic/speculators`
+   - `.venv/bin/python -c "import speculators, torch; print(torch.cuda.device_count())"` → 8 ✓
+     (torch 2.10.0+cu128; `.venv` has speculators editable, NO vllm).
    - `nvidia-smi` → 8 GPUs free (no `llm-compressor` vLLM workers).
-   - Confirm paths exist: dataset `output_dir/Qwen3-8B-FP8_magpie_5k/`, verifier
-     `/home/eldarkurtic/hf_models/Qwen/Qwen3-8B`. If the home path changed, update `ablation/env.sh`.
-   - `df -h /home` → need **≥1.8TB free** for the cache.
+   - Confirmed: dataset `output_dir/Qwen3-8B_magpie_5k/` (non-FP8; `hidden_states/` not yet generated),
+     verifier `/home/eldarkurtic/hf_models/Qwen/Qwen3-8B`, vLLM in `.venv_vllm` (vllm 0.22.1rc1).
+   - `df -h /home` → 2.6TB free ✓ (need **≥1.8TB** for the cache).
 2. **Phase 1 — generate cache (once):** `bash ablation/gen_cache.sh` (launches vLLM HS server on 8
    GPUs, runs offline generation, validates, kills server). Confirms 5000 `hs_*.safetensors` with
    shape `[seq, 10, 4096]`. ~tens of minutes.
@@ -47,13 +54,14 @@ then sweep training/loss/architecture knobs as fast parallel 1-GPU runs. Screen 
 
 ---
 
-## Environment facts (verified on old box — re-verify on new box)
-- **venv (training):** `venv_spec/bin/python` (uv venv, editable `speculators`; the `python` on
-  PATH). **Has NO vllm** and no ruff/mypy. **Plotting only** uses `data_for_plots/.venv`.
-- **venv (vLLM serving):** `VLLM_PY` in `env.sh` = the llm-compressor `venv_lmeval` python (vllm
-  0.20.2). `launch_vllm.py` execs `sys.executable -m vllm`, so the HS server MUST run under this; the
-  data-gen *client* runs under `venv_spec` (needs speculators+openai, not vllm). `gen_cache.sh`
-  already splits them. If `venv_lmeval` moves, set `VLLM_PY`.
+## Environment facts (verified on this 8×H100 box, 2026-05-30)
+- **Repo:** `/home/eldarkurtic/github/eldarkurtic/speculators` (note the doubled `eldarkurtic/`).
+- **venv (training):** `.venv/bin/python` (editable `speculators`, torch 2.10.0+cu128). **Has NO vllm**
+  and no ruff/mypy.
+- **venv (vLLM serving):** `VLLM_PY` in `env.sh` = `.venv_vllm/bin/python` (vllm 0.22.1rc1).
+  `launch_vllm.py` execs `sys.executable -m vllm`, so the HS server MUST run under this; the
+  data-gen *client* runs under `.venv` (needs speculators+openai, not vllm). `gen_cache.sh`
+  already splits them.
 - **Dataset:** `output_dir/Qwen3-8B_magpie_5k/` (non-FP8 — user switched from the FP8 variant;
   same structure) — 5000 examples; columns `input_ids`(int32), `loss_mask`(bool, **assistant-only**),
   `seq_len`; lengths 226–8192 (mean ~4025). 90/10 train/val **by index** (train 0–4499, val
@@ -64,7 +72,7 @@ then sweep training/loss/architecture knobs as fast parallel 1-GPU runs. Screen 
 - **Baseline command (40 min, 1 GPU, 5 ep):**
   ```
   scripts/train.py --verifier-name-or-path /home/eldarkurtic/hf_models/Qwen/Qwen3-8B \
-    --data-path output_dir/Qwen3-8B-FP8_magpie_5k --on-missing generate --on-generate delete \
+    --data-path output_dir/Qwen3-8B_magpie_5k --on-missing generate --on-generate delete \
     --scheduler-type cosine --draft-vocab-size 32000 --max-anchors 3072 \
     --target-layer-ids 1 9 17 25 34 --speculator-type dflash --num-layers 5 \
     --logger wandb --run-name test-qwen3-8b-fp8text --lr 0.0006 --epochs 5
@@ -94,8 +102,8 @@ then sweep training/loss/architecture knobs as fast parallel 1-GPU runs. Screen 
 ## Code changes — IMPLEMENTED & unit-verified (branch `dflash-ablation`)
 All of these are done, py_compile-clean, and unit-tested (losses/dispatch/EAL/layer-subset on random
 tensors; argparse `--help` clean). End-to-end validation = the baseline-from-cache control (§Phase 1.5).
-`make quality` not run — ruff/mypy are NOT installed in `venv_spec` (dev extras missing); install via
-`uv pip install ruff mypy` into `venv_spec` if you want the style/type gate.
+`make quality` not run — ruff/mypy are NOT installed in `.venv` (dev extras missing); install via
+`uv pip install ruff mypy` into `.venv` if you want the style/type gate.
 1. **Loader aux-subset** (`train/data.py`): `ArrowDataset(cache_layer_ids=, aux_layer_ids=)` +
    `_resolve_layer_selection`; `--cache-layer-ids` in `train.py` (run.sh passes the superset).
    `[1,9,17,25,34]` from the 10-layer cache → channels `[0,2,4,6,8]`, target = last.

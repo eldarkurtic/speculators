@@ -6,12 +6,20 @@ set -uo pipefail
 source "$(dirname "$0")/env.sh"
 
 NGPU="${1:-8}"
+# GPU ids to use: $GPUS (space-separated, e.g. "1 2 3 4 5 6 7") overrides; else 0..NGPU-1.
+if [ -n "${GPUS:-}" ]; then
+  read -r -a GPU_IDS <<< "$GPUS"
+else
+  # NOTE: don't use `read <<< "$(seq ...)"` — seq is newline-separated and read takes
+  # only the first line, collapsing to a single GPU. Word-split the substitution instead.
+  GPU_IDS=($(seq 0 $((NGPU - 1))))
+fi
 QUEUE="$ABL/queue.txt"
 [ -f "$QUEUE" ] || { echo "no $QUEUE"; exit 1; }
 
 # Build job list (skip blank/# lines).
 mapfile -t JOBS < <(grep -vE '^\s*(#|$)' "$QUEUE")
-echo ">> ${#JOBS[@]} jobs across $NGPU GPUs"
+echo ">> ${#JOBS[@]} jobs across GPUs: ${GPU_IDS[*]}"
 
 declare -A GPU_PID   # gpu_id -> bg pid
 
@@ -26,7 +34,10 @@ launch() { # $1=gpu  $2=job-line
 
 ji=0
 # Prime each GPU.
-for ((g=0; g<NGPU && ji<${#JOBS[@]}; g++)); do launch "$g" "${JOBS[$ji]}"; ji=$((ji+1)); done
+for g in "${GPU_IDS[@]}"; do
+  ((ji < ${#JOBS[@]})) || break
+  launch "$g" "${JOBS[$ji]}"; ji=$((ji+1))
+done
 # As any job finishes, launch the next on that GPU.
 while ((ji < ${#JOBS[@]})) || ((${#GPU_PID[@]} > 0)); do
   for g in "${!GPU_PID[@]}"; do

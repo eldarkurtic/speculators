@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 
 import torch
@@ -157,6 +158,30 @@ def acceptance_loss(
     p_t = torch.nn.functional.softmax(targets, dim=-1)
     accept = torch.minimum(p_d, p_t).sum(dim=-1)  # shape: [1, seq_len]
     return 1.0 - accept
+
+
+def jsd_loss(
+    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+):
+    """Per-position Jensen-Shannon divergence between draft and target distributions.
+
+    JSD = 0.5*KL(p_d || m) + 0.5*KL(p_t || m) with m = 0.5*(p_d + p_t). Symmetric and
+    bounded in [0, log 2] — a stable middle-ground between forward KL (mass-covering)
+    and reverse KL (mode-seeking).
+    """
+    logp_d = torch.nn.functional.log_softmax(logits, dim=-1)
+    logp_t = torch.nn.functional.log_softmax(targets, dim=-1)
+    p_d = logp_d.exp()
+    p_t = logp_t.exp()
+    # log m where m = 0.5*(p_d + p_t). logaddexp(logp_d, logp_t) = log(p_d + p_t) is
+    # numerically stable and needs no clamp; the previous clamp_min(_EPS=1e-5) exceeded
+    # the ~1/vocab uniform mass for large vocabs, corrupting log m and driving JSD
+    # negative (true JSD lies in [0, log 2]).
+    logm = torch.logaddexp(logp_d, logp_t) - math.log(2.0)
+    kl_dm = (p_d * (logp_d - logm)).sum(dim=-1)
+    kl_tm = (p_t * (logp_t - logm)).sum(dim=-1)
+    return 0.5 * (kl_dm + kl_tm)  # shape: [1, seq_len]
 
 
 def dflash_loss_decay(pos_idx: torch.Tensor, gamma: float):

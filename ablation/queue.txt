@@ -1,43 +1,16 @@
-# DFlash ablation queue — one job per line:  <name> | <extra train.py args>
-# Lines starting with # are ignored. run.sh supplies baseline defaults (dflash, 5 layers, lr 6e-4,
-# cosine, 2 epochs, aux layers 1 9 17 25 34); args here OVERRIDE them. Fan out: bash ablation/queue.sh
-#
-# Fill this in AFTER the Phase-1 cache exists and the code changes (CLI knobs / loss variants) land.
-# Below is a starter set for screening @2 epochs. Layer-selection (Family E) is OFFLOADED to a
-# dedicated node — see ablation/HANDOFF_LAYER_SELECTION.md — so it is intentionally NOT listed here.
+# ===== Phase M3 — SWA/full layer-position mix @ the optimal Muon recipe (repeat of Phase 8) =====
+# Base: Muon lr 0.01 momentum 0.95 + forward-KL + causal + FFN 6144 + depth 5 + window 1024, 5ep,
+# full 4997 data. 's' = sliding window 1024, 'f' = full attention (per layer, index 0->4).
+# Old Phase 8 (AdamW / window 128 / 2-5ep) said: uniform all-SWA best, any 'f' hurts monotonically.
+# Re-test now that "wider window is better" — with s=1024 the s-vs-f contrast is smaller.
+# sssss = the uniform-window-1024 reference. Launch: bash ablation/queue.sh
+# Rank: .venv/bin/python ablation/eal.py --scan ablation/logs
 
-# --- control ---
-baseline                |
-
-# --- A: optimizer / schedule (needs --optimizer/--weight-decay/--grad-clip CLI; see HANDOFF change #2) ---
-# lr-3e-4                | --lr 0.0003
-# lr-1e-3                | --lr 0.001
-# lr-2e-3                | --lr 0.002
-# wd-0.01                | --weight-decay 0.01
-# wd-0.1                 | --weight-decay 0.1
-# sched-linear           | --scheduler-type linear
-# opt-lion               | --optimizer lion --lr 0.0001
-# opt-sgd                | --optimizer sgd --lr 0.01
-# opt-adafactor          | --optimizer adafactor
-# gradclip-0.5           | --grad-clip 0.5
-# gradclip-2.0           | --grad-clip 2.0
-
-# --- B: capacity / architecture ---
-# layers-3               | --num-layers 3
-# layers-7               | --num-layers 7
-# layers-10              | --num-layers 10
-# arch-llama             | --draft-arch llama
-
-# --- C: loss (needs --loss-type / --loss-gamma CLI; see HANDOFF change #3,#4) ---
-# loss-kl                | --loss-type kl
-# loss-reverse-kl        | --loss-type reverse_kl
-# loss-kl-ce             | --loss-type kl_ce
-# gamma-2                | --loss-gamma 2
-# gamma-8                | --loss-gamma 8
-# gamma-inf              | --loss-gamma 1e9
-
-# --- D: data / augmentation ---
-# noise-0                | --noise-std 0
-# noise-0.1              | --noise-std 0.1
-# no-val-noise           | --no-val-noise
-# user-tokens            | --loss-on-all-tokens
+mix-sssss | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern sssss --epochs 5
+mix-fsssf | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern fsssf --epochs 5
+mix-ffsss | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern ffsss --epochs 5
+mix-sssff | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern sssff --epochs 5
+mix-sfsfs | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern sfsfs --epochs 5
+mix-ssfff | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern ssfff --epochs 5
+mix-fffss | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern fffss --epochs 5
+mix-fffff | --optimizer muon --muon-lr 0.01 --muon-momentum 0.95 --loss-type kl --draft-sliding-window 1024 --draft-block-causal --draft-intermediate-size 6144 --swa-layer-pattern fffff --epochs 5

@@ -9,6 +9,8 @@ def create_anchor_block_mask_mod(
     total_seq_len: int,
     anchor_positions: torch.Tensor,
     block_size: int,
+    sliding_window: int | None = None,
+    block_causal: bool = False,
 ):
     """
     Build a flex-attention mask mod where each query block corresponds to one anchor.
@@ -31,6 +33,9 @@ def create_anchor_block_mask_mod(
         total_seq_len: padded packed sequence width
         anchor_positions: [n_anchors] absolute positions into the packed base sequence
         block_size: number of query tokens per anchor block
+        sliding_window: if set, a query may only attend to base tokens within this
+            many positions before its anchor (local/sliding-window attention over the
+            verifier context). None attends to the full prefix.
 
     Returns:
         mask_mod, q_len, kv_len
@@ -101,16 +106,27 @@ def create_anchor_block_mask_mod(
         same_doc = (q_doc == kv_doc) & (q_doc != -1)
         before_anchor = kv_base_pos < q_anchor
 
-        return kv_is_base & same_doc & before_anchor
+        allowed = kv_is_base & same_doc & before_anchor
+        if sliding_window is not None:
+            within_window = (q_anchor - kv_base_pos) <= sliding_window
+            allowed = allowed & within_window
+        return allowed
 
     def same_block_mod(_b, _h, q_idx, kv_idx):
         """
-        Queries may attend bidirectionally to all tokens in their own synthetic block.
+        Queries attend to tokens in their own synthetic block: bidirectionally by
+        default, or causally (only the anchor + earlier drafted positions) when
+        block_causal is set.
         """
         q_block = q_idx // block_size
         kv_is_block = kv_idx >= total_seq_len
         kv_block = (kv_idx - total_seq_len) // block_size
 
-        return kv_is_block & (q_block == kv_block)
+        allowed = kv_is_block & (q_block == kv_block)
+        if block_causal:
+            q_in_block = q_idx % block_size
+            kv_in_block = (kv_idx - total_seq_len) % block_size
+            allowed = allowed & (kv_in_block <= q_in_block)
+        return allowed
 
     return or_masks(base_prefix_mod, same_block_mod), q_len, kv_len

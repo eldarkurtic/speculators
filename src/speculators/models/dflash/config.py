@@ -71,6 +71,43 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         description="Token ID used for masking",
     )
 
+    fusion_type: Literal["linear", "mlp", "gated", "weighted_sum"] = Field(
+        default="linear",
+        description=(
+            "How the auxiliary verifier hidden states are fused into the draft "
+            "hidden size. 'linear' (baseline) is a single Linear over the "
+            "concatenated layers; 'mlp' is a 2-layer MLP; 'gated' is SwiGLU; "
+            "'weighted_sum' learns per-layer weights then projects."
+        ),
+    )
+
+    draft_sliding_window: int | None = Field(
+        default=None,
+        description=(
+            "If set, restrict each draft query to attend only to verifier-context "
+            "tokens within this many positions before its anchor (sliding-window "
+            "attention). None (baseline) attends to the full prefix."
+        ),
+    )
+
+    draft_block_causal: bool = Field(
+        default=False,
+        description=(
+            "If True, intra-block attention is causal (each drafted position attends "
+            "only to the anchor + earlier positions in its block). Default False = "
+            "bidirectional within the block."
+        ),
+    )
+
+    swa_layer_pattern: str | None = Field(
+        default=None,
+        description=(
+            "Per-layer attention mix as a string of length num_hidden_layers, one char "
+            "per draft layer: 's' = sliding window (draft_sliding_window), 'f' = full "
+            "attention. None = uniform (all layers use draft_sliding_window if set)."
+        ),
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""

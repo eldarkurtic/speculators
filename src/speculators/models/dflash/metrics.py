@@ -11,6 +11,7 @@ from speculators.models.metrics import (
     ce_loss,
     compute_accuracy_multi_step,
     dflash_loss_decay,
+    jsd_loss,
     kl_div_loss,
     loss_function,
     reverse_kl_div_loss,
@@ -34,8 +35,10 @@ def _select_loss_fn(
         return lambda lo, ta: 0.5 * kl_div_loss(lo, ta) + 0.5 * ce_loss(lo, ta)
     if lt == "lk":
         return acceptance_loss
+    if lt == "jsd":
+        return jsd_loss
     raise ValueError(
-        f"Unknown loss_type '{loss_type}'. Choose ce, kl, reverse_kl, kl_ce, lk."
+        f"Unknown loss_type '{loss_type}'. Choose ce, kl, reverse_kl, kl_ce, lk, jsd."
     )
 
 

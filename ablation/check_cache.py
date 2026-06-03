@@ -1,6 +1,6 @@
 """Sanity-check the hidden-state cache: count files and inspect one sample's shape/dtype.
 
-Run with the training venv:  venv_spec/bin/python ablation/check_cache.py
+Run with the training venv:  .venv/bin/python ablation/check_cache.py
 """
 
 import os
@@ -9,8 +9,12 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-CACHE_DIR = Path(os.environ.get("CACHE_DIR", "")) or (
-    Path(__file__).resolve().parents[1] / "output_dir/Qwen3-8B_magpie_5k/hidden_states"
+_env_cache_dir = os.environ.get("CACHE_DIR", "")
+CACHE_DIR = (
+    Path(_env_cache_dir)
+    if _env_cache_dir
+    else Path(__file__).resolve().parents[1]
+    / "output_dir/Qwen3-8B_magpie_5k/hidden_states"
 )
 
 
@@ -26,7 +30,8 @@ def main() -> int:
         hs = f.get_slice("hidden_states")
         shape = list(hs.get_shape())
         print(f"sample: {files[0].name}  keys={keys}  hidden_states shape={shape}")
-        # expect [seq_len, num_superset_layers(=10), hidden_size(=4096)]
+        # expect [seq_len, num_superset_layers(=6: aux 1 9 17 25 34 + target 36),
+        #         hidden_size(=4096)]
         if len(shape) != 3:
             print("!! unexpected rank (want [seq, n_layers, hidden])")
             return 1

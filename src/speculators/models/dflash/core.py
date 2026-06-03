@@ -21,6 +21,70 @@ from speculators.models.dflash.utils import (
 from speculators.models.utils import resolve_target_layer_ids
 
 
+class _MLPFusion(nn.Module):
+    """2-layer MLP fusion: Linear -> SiLU -> Linear (concatenated aux -> hidden)."""
+
+    def __init__(self, in_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden, bias=False)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _GatedFusion(nn.Module):
+    """SwiGLU-style gated fusion (concatenated aux -> hidden)."""
+
+    def __init__(self, in_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.gate = nn.Linear(in_dim, hidden, bias=False)
+        self.up = nn.Linear(in_dim, hidden, bias=False)
+        self.down = nn.Linear(hidden, hidden, bias=False)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(self.act(self.gate(x)) * self.up(x))
+
+
+class _WeightedSumFusion(nn.Module):
+    """Learned softmax-weighted sum over aux layers, then a Linear projection."""
+
+    def __init__(self, n_aux: int, hidden: int) -> None:
+        super().__init__()
+        self.n_aux = n_aux
+        self.hidden = hidden
+        self.weights = nn.Parameter(torch.zeros(n_aux))
+        self.proj = nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., n_aux * hidden] -> [..., n_aux, hidden]
+        leading = x.shape[:-1]
+        x = x.view(*leading, self.n_aux, self.hidden)
+        w = torch.softmax(self.weights, dim=0).view(
+            *([1] * len(leading)), self.n_aux, 1
+        )
+        return self.proj((x * w).sum(dim=-2))
+
+
+def _build_fusion(fusion_type: str, n_aux: int, hidden: int) -> nn.Module:
+    """Build the aux-hidden-state fusion module (maps [.., n_aux*hidden] -> [.., hidden])."""
+    in_dim = n_aux * hidden
+    if fusion_type == "linear":
+        return nn.Linear(in_dim, hidden, bias=False)
+    if fusion_type == "mlp":
+        return _MLPFusion(in_dim, hidden)
+    if fusion_type == "gated":
+        return _GatedFusion(in_dim, hidden)
+    if fusion_type == "weighted_sum":
+        return _WeightedSumFusion(n_aux, hidden)
+    raise ValueError(
+        f"Unknown fusion_type '{fusion_type}'. "
+        "Expected one of: linear, mlp, gated, weighted_sum."
+    )
+
+
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[DFlashSpeculatorConfig]] = DFlashSpeculatorConfig  # type: ignore[misc]
@@ -61,6 +125,29 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 for layer_idx in range(num_draft_layers)
             ]
         )
+        if (
+            config.swa_layer_pattern is not None
+            and len(config.swa_layer_pattern) != num_draft_layers
+        ):
+            raise ValueError(
+                f"swa_layer_pattern '{config.swa_layer_pattern}' has length "
+                f"{len(config.swa_layer_pattern)} but the draft has {num_draft_layers} "
+                "layers; provide one char ('s'/'f') per layer."
+            )
+        if config.swa_layer_pattern is not None:
+            invalid = set(config.swa_layer_pattern) - {"s", "f"}
+            if invalid:
+                raise ValueError(
+                    f"swa_layer_pattern '{config.swa_layer_pattern}' has invalid "
+                    f"character(s) {sorted(invalid)}; only 's' (sliding window) and "
+                    "'f' (full attention) are allowed."
+                )
+            if "s" in config.swa_layer_pattern and config.draft_sliding_window is None:
+                raise ValueError(
+                    "swa_layer_pattern requests sliding-window ('s') layers but "
+                    "draft_sliding_window is None; set draft_sliding_window or use a "
+                    "pattern of only 'f' (which would be a no-op vs full attention)."
+                )
 
         if config.aux_hidden_state_layer_ids is None:
             raise ValueError(
@@ -75,10 +162,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
 
-        self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
+        self.fc = _build_fusion(
+            config.fusion_type,
+            len(self.target_layer_ids),
             config.transformer_layer_config.hidden_size,
-            bias=False,
         )
         self.hidden_norm = Qwen3RMSNorm(
             config.transformer_layer_config.hidden_size,
@@ -143,6 +230,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             max_anchors=kwargs.get("max_anchors", 3072),
             aux_hidden_state_layer_ids=target_layer_ids,
             mask_token_id=kwargs.get("mask_token_id"),
+            fusion_type=kwargs.get("fusion_type", "linear"),
+            draft_sliding_window=kwargs.get("draft_sliding_window"),
+            draft_block_causal=kwargs.get("draft_block_causal", False),
+            swa_layer_pattern=kwargs.get("swa_layer_pattern"),
             speculators_config=SpeculatorsConfig(
                 algorithm="dflash",
                 proposal_methods=[
@@ -231,6 +322,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             total_seq_len=total_seq_len,
             anchor_positions=anchor_positions,
             block_size=self.block_size,
+            sliding_window=self.config.draft_sliding_window,
+            block_causal=self.config.draft_block_causal,
         )
 
         attention_mask = create_block_mask(
@@ -241,6 +334,27 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             KV_LEN=kv_len,
             device=device,
         )
+
+        # Per-layer SWA/full mix. attention_mask uses the configured sliding window
+        # (the 's' layers). When swa_layer_pattern is set, also build a full-attention
+        # mask and assign masks per draft layer ('s'=sliding window, 'f'=full).
+        layer_masks = [attention_mask] * len(self.layers)
+        if self.config.swa_layer_pattern:
+            full_mod, _, _ = create_anchor_block_mask_mod(
+                lengths=lengths.to(device),
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                block_size=self.block_size,
+                sliding_window=None,
+                block_causal=self.config.draft_block_causal,
+            )
+            full_mask = create_block_mask(
+                full_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
+            )
+            layer_masks = [
+                attention_mask if c == "s" else full_mask
+                for c in self.config.swa_layer_pattern
+            ]
 
         mask_tokens_size = num_anchors * self.block_size
 
@@ -281,11 +395,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
-        for layer in self.layers:
+        for layer, layer_mask in zip(self.layers, layer_masks):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
                 target_hidden=fc_output,
-                attention_mask=attention_mask,
+                attention_mask=layer_mask,
                 position_ids=position_ids,
                 use_cache=False,
                 position_embeddings=position_embeddings,

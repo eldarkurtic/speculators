@@ -24,10 +24,10 @@ session checkpoint). Layer-selection is offloaded to a dedicated node:
 
 ## Quickstart (new node)
 ```bash
-cd /home/eldarkurtic/github/speculators
-venv_spec/bin/python -c "import speculators, torch; print(torch.cuda.device_count())"   # expect 8
+cd /home/eldarkurtic/github/eldarkurtic/speculators
+.venv/bin/python -c "import speculators, torch; print(torch.cuda.device_count())"   # expect 8
 bash ablation/gen_cache.sh 8          # dry-run cache on 8 samples; then full: bash ablation/gen_cache.sh
-venv_spec/bin/python ablation/check_cache.py
+.venv/bin/python ablation/check_cache.py
 # apply loader subset change (HANDOFF change #1), then:
 bash ablation/run.sh baseline 0 -- --epochs 5     # control
 # ... implement CLI knobs / loss variants, fill queue.txt, then:

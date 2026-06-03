@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch._inductor.config as _inductor_config
 from torch.utils.data import DataLoader
 from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
@@ -106,6 +107,10 @@ def create_transformer_layer_config(
     num_layers: int,
     draft_arch: str = "llama",
     hidden_act: str | None = None,
+    intermediate_size: int | None = None,
+    num_attention_heads: int | None = None,
+    num_key_value_heads: int | None = None,
+    decoder_use_mlp: bool = True,
 ) -> PretrainedConfig:
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
@@ -139,13 +144,21 @@ def create_transformer_layer_config(
             "nor 'hidden_activation'"
         )
 
-    return config_class(
+    num_attention_heads = num_attention_heads or verifier_config.num_attention_heads
+    num_key_value_heads = num_key_value_heads or verifier_config.num_key_value_heads
+    if num_attention_heads % num_key_value_heads != 0:
+        raise ValueError(
+            f"--draft-num-heads ({num_attention_heads}) must be divisible by "
+            f"--draft-num-kv-heads ({num_key_value_heads})."
+        )
+
+    config = config_class(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
-        intermediate_size=verifier_config.intermediate_size,
+        intermediate_size=intermediate_size or verifier_config.intermediate_size,
         num_hidden_layers=num_layers,
-        num_attention_heads=verifier_config.num_attention_heads,
-        num_key_value_heads=verifier_config.num_key_value_heads,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
         hidden_act=hidden_act,
         max_position_embeddings=verifier_config.max_position_embeddings,
         initializer_range=verifier_config.initializer_range,
@@ -153,6 +166,10 @@ def create_transformer_layer_config(
         head_dim=getattr(verifier_config, "head_dim", None),
         tie_word_embeddings=False,
     )
+    # Architecture-ablation flag read by the DFlash decoder layer; default keeps
+    # the baseline (MLP present). Stored on the draft config so it serializes.
+    config.decoder_use_mlp = decoder_use_mlp
+    return config
 
 
 def _load_mappings(d2t_path, t2d_path, expected_draft_vocab_size: int | None):
@@ -231,6 +248,14 @@ def main(args: argparse.Namespace):
     # Set random seed for reproducibility
     set_seed(args.seed, args.deterministic_cuda)
 
+    # torch 2.10's inductor has a joint-graph pattern-matcher bug that crashes
+    # compilation of the DFlash forward at real shapes (RuntimeError: Not all inputs to
+    # pattern found in match.kwargs ... argnames=['x','slice_shape']). The failing pass
+    # is gated by config.pattern_matcher. Scope the workaround to the DFlash path so the
+    # eagle3 compile path is left untouched.
+    if args.speculator_type == "dflash":
+        _inductor_config.pattern_matcher = False
+
     # Setup logging
     setup_root_logger()
     setup_metric_logger(
@@ -253,6 +278,10 @@ def main(args: argparse.Namespace):
         args.num_layers,
         draft_arch=args.draft_arch,
         hidden_act=args.draft_hidden_act,
+        intermediate_size=args.draft_intermediate_size,
+        num_attention_heads=args.draft_num_heads,
+        num_key_value_heads=args.draft_num_kv_heads,
+        decoder_use_mlp=not args.no_decoder_mlp,
     )
 
     args.mask_token_id = resolve_mask_token_id(
@@ -273,6 +302,12 @@ def main(args: argparse.Namespace):
         draft_model = model_class.from_pretrained(
             args.from_pretrained, t2d=t2d, d2t=d2t
         )
+        # from_pretrained skips from_training_args, so set the training-only loss
+        # attrs from args (PreTrainedModel otherwise leaves loss_type=None -> crash).
+        # Enables loss-switched fine-tuning (e.g. CE-pretrain -> lk-finetune).
+        draft_model.loss_type = args.loss_type
+        draft_model.loss_gamma = args.loss_gamma
+        draft_model.label_smoothing = args.label_smoothing
     else:
         args_dict = vars(args)
         args_dict["draft_vocab_size"] = draft_vocab_size
@@ -383,6 +418,8 @@ def main(args: argparse.Namespace):
         weight_decay=args.weight_decay,
         adam_betas=tuple(args.adam_betas),
         sgd_momentum=args.sgd_momentum,
+        muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
         grad_clip=args.grad_clip,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
@@ -507,11 +544,26 @@ def parse_args():
         "--optimizer",
         type=str,
         default="adamw",
-        choices=["adamw", "adam", "sgd", "rmsprop", "adafactor", "lion"],
+        choices=["adamw", "adam", "sgd", "rmsprop", "adafactor", "lion", "muon"],
         help="Optimizer to use (default: adamw).",
     )
     parser.add_argument(
-        "--weight-decay", type=float, default=0.0, help="Optimizer weight decay."
+        "--weight-decay", type=float, default=0.01, help="Optimizer weight decay."
+    )
+    parser.add_argument(
+        "--muon-lr",
+        type=float,
+        default=0.02,
+        help=(
+            "Muon matrix-group LR for --optimizer muon. Not comparable to --lr; "
+            "re-sweep ~0.005-0.05. Aux (1D) group uses --lr. Single-GPU only."
+        ),
+    )
+    parser.add_argument(
+        "--muon-momentum",
+        type=float,
+        default=0.95,
+        help="Momentum for Muon (default: 0.95).",
     )
     parser.add_argument(
         "--adam-betas",
@@ -536,10 +588,11 @@ def parse_args():
         "--loss-type",
         type=str,
         default="ce",
-        choices=["ce", "kl", "reverse_kl", "kl_ce", "lk"],
+        choices=["ce", "kl", "reverse_kl", "kl_ce", "lk", "jsd"],
         help=(
             "DFlash distillation loss: ce (hard-label, default), kl (forward KL), "
-            "reverse_kl, kl_ce (blend), lk (acceptance-rate surrogate)."
+            "reverse_kl, kl_ce (blend), lk (acceptance-rate surrogate), "
+            "jsd (Jensen-Shannon)."
         ),
     )
     parser.add_argument(
@@ -586,6 +639,66 @@ def parse_args():
         help="Activation function for draft decoder layers. Defaults to the verifier's "
         "activation. Useful for dflash which uses Qwen3 layers that expects 'silu' for "
         "vLLM deployment.",
+    )
+    # --- DFlash architecture-ablation knobs (default values reproduce the baseline) ---
+    parser.add_argument(
+        "--draft-intermediate-size",
+        type=int,
+        default=None,
+        help="(DFlash arch ablation) Draft FFN intermediate size. Defaults to the "
+        "verifier's intermediate_size.",
+    )
+    parser.add_argument(
+        "--draft-num-heads",
+        type=int,
+        default=None,
+        help="(DFlash arch ablation) Draft attention head count. Defaults to the "
+        "verifier's. head_dim is held fixed; must be divisible by --draft-num-kv-heads.",
+    )
+    parser.add_argument(
+        "--draft-num-kv-heads",
+        type=int,
+        default=None,
+        help="(DFlash arch ablation) Draft key/value head count (GQA). Defaults to the "
+        "verifier's.",
+    )
+    parser.add_argument(
+        "--no-decoder-mlp",
+        action="store_true",
+        help="(DFlash arch ablation) Drop the FFN/MLP sub-block from each draft decoder "
+        "layer (attention-only draft).",
+    )
+    parser.add_argument(
+        "--fusion-type",
+        type=str,
+        default="linear",
+        choices=["linear", "mlp", "gated", "weighted_sum"],
+        help="(DFlash arch ablation) How aux verifier hidden states are fused. "
+        "'linear' (baseline), 'mlp', 'gated' (SwiGLU), or 'weighted_sum'.",
+    )
+    parser.add_argument(
+        "--draft-sliding-window",
+        type=int,
+        default=None,
+        help="(DFlash arch ablation) Restrict each draft query to attend only to "
+        "verifier-context tokens within this many positions before its anchor. "
+        "Default (None) attends to the full prefix.",
+    )
+    parser.add_argument(
+        "--draft-block-causal",
+        action="store_true",
+        help="(DFlash arch ablation) Make intra-block attention causal (each drafted "
+        "position sees only the anchor + earlier positions in its block). Default is "
+        "bidirectional within the block.",
+    )
+    parser.add_argument(
+        "--swa-layer-pattern",
+        type=str,
+        default=None,
+        help="(DFlash arch ablation) Per-layer attention mix, one char per draft layer: "
+        "'s'=sliding window (--draft-sliding-window), 'f'=full. e.g. 'ssfff' for a "
+        "5-layer draft. Length must equal --num-layers. Default: all layers use the "
+        "sliding window if set.",
     )
     parser.add_argument(
         "--target-layer-ids",

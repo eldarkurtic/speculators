@@ -201,7 +201,7 @@ class ArrowDataset(BaseDataset):
         """
         self.data = load_from_disk(datapath)
         if split_ratio == 1.0:
-            pass
+            self.start_file_idx = 0  # whole dataset; hs file idx == row idx
         elif 1.0 > split_ratio > 0:
             self.start_file_idx = 0
             split_idx = int(len(self.data) * split_ratio)
@@ -252,6 +252,12 @@ class ArrowDataset(BaseDataset):
                 )
             aux_indices = [cache_layer_ids.index(lid) for lid in aux_layer_ids]
             return aux_indices, len(cache_layer_ids) - 1
+        if bool(cache_layer_ids) != bool(aux_layer_ids):
+            raise ValueError(
+                "cache_layer_ids and aux_layer_ids must be provided together (or both "
+                f"omitted for the legacy all-but-last path); got cache_layer_ids="
+                f"{cache_layer_ids}, aux_layer_ids={aux_layer_ids}."
+            )
         return None, -1
 
     def _map_to_file_idx(self, index: int):

@@ -16,7 +16,7 @@ echo ">> Launching vLLM hidden-state server (layers: $SUPERSET_LAYERS) via VLLM_
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$VLLM_PY" "$REPO/scripts/launch_vllm.py" "$VERIFIER" \
   --hidden-states-path "$HS_SCRATCH" \
   --target-layer-ids $SUPERSET_LAYERS \
-  -- --max-model-len "${MAX_MODEL_LEN:-12288}" -tp 1 --data-parallel-size 8 --gpu-memory-utilization 0.9 \
+  -- --max-model-len 12288 -tp 1 --data-parallel-size 8 --gpu-memory-utilization 0.9 \
      --no-enable-chunked-prefill \
   > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
