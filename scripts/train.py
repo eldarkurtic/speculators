@@ -678,6 +678,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -702,6 +703,14 @@ def _checkpoint_freq(value: str) -> float:
             "as epoch counts and must be whole numbers."
         )
     return fvalue
+
+
+def _positive_int(value: str) -> int:
+    # argparse prepends "argument <flag>: " to the message, so keep it flag-agnostic.
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer (>= 1)")
+    return ivalue
 
 
 # CLI flags that synthesize the draft decoder shape. They conflict with both
@@ -923,6 +932,15 @@ def parse_args():
         type=int,
         default=1,
         help="Log training metrics every N steps (default: 1)",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Accumulate grads over N microbatches before an optimizer step "
+            "(effective batch = per-step batch * N). Default: 1."
+        ),
     )
     parser.add_argument("--log-dir", type=str, default="./logs")
     parser.add_argument("--run-name", type=str, default=None)

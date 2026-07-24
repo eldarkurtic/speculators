@@ -1,5 +1,7 @@
 """Tests for CLI arguments."""
 
+import pytest
+
 from scripts.train import parse_args
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
@@ -169,3 +171,23 @@ def test_no_norm_before_fc_flag(monkeypatch):
 def test_no_norm_output_flag(monkeypatch):
     args = _parse(monkeypatch, ["--no-norm-output"])
     assert args.norm_output is False
+
+
+# ---------------------------------------------------------------------------
+# Gradient accumulation
+# ---------------------------------------------------------------------------
+
+
+def test_gradient_accumulation_steps_default(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.gradient_accumulation_steps == 1
+
+
+def test_gradient_accumulation_steps_explicit(monkeypatch):
+    args = _parse(monkeypatch, ["--gradient-accumulation-steps", "8"])
+    assert args.gradient_accumulation_steps == 8
+
+
+def test_gradient_accumulation_steps_rejects_zero(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--gradient-accumulation-steps", "0"])
